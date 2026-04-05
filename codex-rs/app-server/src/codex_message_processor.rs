@@ -1,4 +1,5 @@
 use crate::bespoke_event_handling::apply_bespoke_event_handling;
+use crate::code_graph::run_code_graph_query;
 use crate::command_exec::CommandExecManager;
 use crate::command_exec::StartCommandExecParams;
 use crate::config_api::apply_runtime_feature_enablement;
@@ -35,6 +36,8 @@ use codex_app_server_protocol::CancelLoginAccountResponse;
 use codex_app_server_protocol::CancelLoginAccountStatus;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponse;
+use codex_app_server_protocol::CodeGraphQueryParams;
+use codex_app_server_protocol::CodeGraphQueryResponse;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::CollaborationModeListParams;
 use codex_app_server_protocol::CollaborationModeListResponse;
@@ -917,6 +920,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::GetAuthStatus { request_id, params } => {
                 self.get_auth_status(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::CodeGraphQuery { request_id, params } => {
+                self.code_graph_query(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::FuzzyFileSearch { request_id, params } => {
@@ -7452,7 +7459,15 @@ impl CodexMessageProcessor {
 
         let results = match query.as_str() {
             "" => vec![],
-            _ => run_fuzzy_file_search(query, roots, cancel_flag.clone()).await,
+            _ => {
+                run_fuzzy_file_search(
+                    self.config.codex_home.as_path(),
+                    query,
+                    roots,
+                    cancel_flag.clone(),
+                )
+                .await
+            }
         };
 
         if let Some(token) = cancellation_token {
@@ -7466,6 +7481,59 @@ impl CodexMessageProcessor {
 
         let response = FuzzyFileSearchResponse { files: results };
         self.outgoing.send_response(request_id, response).await;
+    }
+
+    async fn code_graph_query(
+        &mut self,
+        request_id: ConnectionRequestId,
+        params: CodeGraphQueryParams,
+    ) {
+        let CodeGraphQueryParams {
+            query,
+            roots,
+            limit,
+            expand_nodes,
+        } = params;
+
+        let codex_home = self.config.codex_home.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            run_code_graph_query(codex_home, query, roots, limit, expand_nodes)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(response)) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        CodeGraphQueryResponse {
+                            entry_node_ids: response.entry_node_ids,
+                            flow: response.flow,
+                            nodes: response.nodes,
+                            files: response.files,
+                            compiled_context: response.compiled_context,
+                            cache_status: response.cache_status,
+                        },
+                    )
+                    .await;
+            }
+            Ok(Err(err)) => {
+                let error = JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("failed to query code graph: {err}"),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+            }
+            Err(err) => {
+                let error = JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("failed to join code graph task: {err}"),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+            }
+        }
     }
 
     async fn fuzzy_file_search_session_start(
@@ -7484,8 +7552,12 @@ impl CodexMessageProcessor {
             return;
         }
 
-        let session =
-            start_fuzzy_file_search_session(session_id.clone(), roots, self.outgoing.clone());
+        let session = start_fuzzy_file_search_session(
+            self.config.codex_home.clone(),
+            session_id.clone(),
+            roots,
+            self.outgoing.clone(),
+        );
         match session {
             Ok(session) => {
                 let mut sessions = self.fuzzy_search_sessions.lock().await;

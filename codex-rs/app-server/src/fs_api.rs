@@ -51,6 +51,7 @@ impl FsApi {
             .map_err(map_fs_error)?;
         Ok(FsReadFileResponse {
             data_base64: STANDARD.encode(bytes),
+            graph_context: None,
         })
     }
 

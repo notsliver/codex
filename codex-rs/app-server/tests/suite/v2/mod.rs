@@ -1,6 +1,7 @@
 mod account;
 mod analytics;
 mod app_list;
+mod code_graph;
 mod collaboration_mode_list;
 #[cfg(unix)]
 mod command_exec;

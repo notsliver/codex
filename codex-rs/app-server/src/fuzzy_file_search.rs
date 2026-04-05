@@ -1,4 +1,4 @@
-use std::num::NonZero;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -10,88 +10,49 @@ use codex_app_server_protocol::FuzzyFileSearchResult;
 use codex_app_server_protocol::FuzzyFileSearchSessionCompletedNotification;
 use codex_app_server_protocol::FuzzyFileSearchSessionUpdatedNotification;
 use codex_app_server_protocol::ServerNotification;
-use codex_file_search as file_search;
+use codex_code_graph::query_graph_file_matches;
 use tracing::warn;
 
 use crate::outgoing_message::OutgoingMessageSender;
 
 const MATCH_LIMIT: usize = 50;
-const MAX_THREADS: usize = 12;
 
 pub(crate) async fn run_fuzzy_file_search(
+    codex_home: &Path,
     query: String,
     roots: Vec<String>,
     cancellation_flag: Arc<AtomicBool>,
 ) -> Vec<FuzzyFileSearchResult> {
-    if roots.is_empty() {
+    if cancellation_flag.load(Ordering::Relaxed) || roots.is_empty() {
         return Vec::new();
     }
 
-    #[expect(clippy::expect_used)]
-    let limit = NonZero::new(MATCH_LIMIT).expect("MATCH_LIMIT should be a valid non-zero usize");
-
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let threads = cores.min(MAX_THREADS);
-    #[expect(clippy::expect_used)]
-    let threads = NonZero::new(threads.max(1)).expect("threads should be non-zero");
-    let search_dirs: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-
-    let mut files = match tokio::task::spawn_blocking(move || {
-        file_search::run(
-            query.as_str(),
-            search_dirs,
-            file_search::FileSearchOptions {
-                limit,
-                threads,
-                compute_indices: true,
-                ..Default::default()
-            },
-            Some(cancellation_flag),
-        )
-    })
-    .await
-    {
-        Ok(Ok(res)) => res
-            .matches
-            .into_iter()
-            .map(|m| {
-                let file_name = m.path.file_name().unwrap_or_default();
-                FuzzyFileSearchResult {
-                    root: m.root.to_string_lossy().to_string(),
-                    path: m.path.to_string_lossy().to_string(),
-                    match_type: match m.match_type {
-                        file_search::MatchType::File => FuzzyFileSearchMatchType::File,
-                        file_search::MatchType::Directory => FuzzyFileSearchMatchType::Directory,
-                    },
-                    file_name: file_name.to_string_lossy().to_string(),
-                    score: m.score,
-                    indices: m.indices,
-                }
-            })
-            .collect::<Vec<_>>(),
-        Ok(Err(err)) => {
-            warn!("fuzzy-file-search failed: {err}");
-            Vec::new()
-        }
+    let files = match query_graph_file_matches(codex_home, &roots, query.as_str()).await {
+        Ok(files) => files,
         Err(err) => {
-            warn!("fuzzy-file-search join failed: {err}");
+            warn!("graph-backed fuzzy-file-search failed: {err}");
             Vec::new()
         }
     };
-
-    files.sort_by(file_search::cmp_by_score_desc_then_path_asc::<
-        FuzzyFileSearchResult,
-        _,
-        _,
-    >(|f| f.score, |f| f.path.as_str()));
+    if cancellation_flag.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
 
     files
+        .into_iter()
+        .take(MATCH_LIMIT)
+        .map(|file_match| FuzzyFileSearchResult {
+            root: file_match.root,
+            path: file_match.path,
+            match_type: FuzzyFileSearchMatchType::File,
+            file_name: file_match.file_name,
+            score: file_match.score,
+            indices: file_match.indices,
+        })
+        .collect()
 }
 
 pub(crate) struct FuzzyFileSearchSession {
-    session: file_search::FileSearchSession,
     shared: Arc<SessionShared>,
 }
 
@@ -105,7 +66,62 @@ impl FuzzyFileSearchSession {
             let mut latest_query = self.shared.latest_query.lock().unwrap();
             *latest_query = query.clone();
         }
-        self.session.update_query(&query);
+
+        let shared = Arc::clone(&self.shared);
+        self.shared.runtime.spawn(async move {
+            let files = if query.is_empty() {
+                Vec::new()
+            } else {
+                match query_graph_file_matches(
+                    shared.codex_home.as_path(),
+                    &shared.roots,
+                    query.as_str(),
+                )
+                .await
+                {
+                    Ok(files) => files
+                        .into_iter()
+                        .take(MATCH_LIMIT)
+                        .map(|file_match| FuzzyFileSearchResult {
+                            root: file_match.root,
+                            path: file_match.path,
+                            match_type: FuzzyFileSearchMatchType::File,
+                            file_name: file_match.file_name,
+                            score: file_match.score,
+                            indices: file_match.indices,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        warn!("graph-backed fuzzy-file-search session failed: {err}");
+                        Vec::new()
+                    }
+                }
+            };
+
+            if shared.canceled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let notification = ServerNotification::FuzzyFileSearchSessionUpdated(
+                FuzzyFileSearchSessionUpdatedNotification {
+                    session_id: shared.session_id.clone(),
+                    query: query.clone(),
+                    files,
+                },
+            );
+            shared.outgoing.send_server_notification(notification).await;
+
+            if shared.canceled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let notification = ServerNotification::FuzzyFileSearchSessionCompleted(
+                FuzzyFileSearchSessionCompletedNotification {
+                    session_id: shared.session_id.clone(),
+                },
+            );
+            shared.outgoing.send_server_notification(notification).await;
+        });
     }
 }
 
@@ -116,48 +132,27 @@ impl Drop for FuzzyFileSearchSession {
 }
 
 pub(crate) fn start_fuzzy_file_search_session(
+    codex_home: PathBuf,
     session_id: String,
     roots: Vec<String>,
     outgoing: Arc<OutgoingMessageSender>,
 ) -> anyhow::Result<FuzzyFileSearchSession> {
-    #[expect(clippy::expect_used)]
-    let limit = NonZero::new(MATCH_LIMIT).expect("MATCH_LIMIT should be a valid non-zero usize");
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let threads = cores.min(MAX_THREADS);
-    #[expect(clippy::expect_used)]
-    let threads = NonZero::new(threads.max(1)).expect("threads should be non-zero");
-    let search_dirs: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-    let canceled = Arc::new(AtomicBool::new(false));
-
-    let shared = Arc::new(SessionShared {
-        session_id,
-        latest_query: Mutex::new(String::new()),
-        outgoing,
-        runtime: tokio::runtime::Handle::current(),
-        canceled: canceled.clone(),
-    });
-
-    let reporter = Arc::new(SessionReporterImpl {
-        shared: shared.clone(),
-    });
-    let session = file_search::create_session(
-        search_dirs,
-        file_search::FileSearchOptions {
-            limit,
-            threads,
-            compute_indices: true,
-            ..Default::default()
-        },
-        reporter,
-        Some(canceled),
-    )?;
-
-    Ok(FuzzyFileSearchSession { session, shared })
+    Ok(FuzzyFileSearchSession {
+        shared: Arc::new(SessionShared {
+            codex_home,
+            roots,
+            session_id,
+            latest_query: Mutex::new(String::new()),
+            outgoing,
+            runtime: tokio::runtime::Handle::current(),
+            canceled: Arc::new(AtomicBool::new(false)),
+        }),
+    })
 }
 
 struct SessionShared {
+    codex_home: PathBuf,
+    roots: Vec<String>,
     session_id: String,
     latest_query: Mutex<String>,
     outgoing: Arc<OutgoingMessageSender>,
@@ -165,92 +160,54 @@ struct SessionShared {
     canceled: Arc<AtomicBool>,
 }
 
-struct SessionReporterImpl {
-    shared: Arc<SessionShared>,
+#[cfg(test)]
+mod tests {
+    use super::run_fuzzy_file_search;
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn run_fuzzy_file_search_returns_graph_backed_matches() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let source_path = workspace.path().join("src/lib.rs");
+        fs::create_dir_all(source_path.parent().expect("source parent"))?;
+        fs::write(
+            &source_path,
+            r#"
+pub fn refresh_models_cache() {
+    build_graph_snapshot();
 }
 
-impl SessionReporterImpl {
-    fn send_snapshot(&self, snapshot: &file_search::FileSearchSnapshot) {
-        if self.shared.canceled.load(Ordering::Relaxed) {
-            return;
-        }
+fn build_graph_snapshot() {}
+"#,
+        )?;
 
-        let query = {
-            #[expect(clippy::unwrap_used)]
-            self.shared.latest_query.lock().unwrap().clone()
-        };
-        if snapshot.query != query {
-            return;
-        }
+        let roots = vec![workspace.path().to_string_lossy().into_owned()];
+        let initial = run_fuzzy_file_search(
+            codex_home.path(),
+            "models cache".to_string(),
+            roots.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].path, "src/lib.rs");
 
-        let files = if query.is_empty() {
-            Vec::new()
-        } else {
-            collect_files(snapshot)
-        };
+        fs::remove_file(&source_path)?;
 
-        let notification = ServerNotification::FuzzyFileSearchSessionUpdated(
-            FuzzyFileSearchSessionUpdatedNotification {
-                session_id: self.shared.session_id.clone(),
-                query,
-                files,
-            },
-        );
-        let outgoing = self.shared.outgoing.clone();
-        self.shared.runtime.spawn(async move {
-            outgoing.send_server_notification(notification).await;
-        });
+        let cached = run_fuzzy_file_search(
+            codex_home.path(),
+            "models cache".to_string(),
+            roots,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].path, "src/lib.rs");
+        Ok(())
     }
-
-    fn send_complete(&self) {
-        if self.shared.canceled.load(Ordering::Relaxed) {
-            return;
-        }
-        let session_id = self.shared.session_id.clone();
-        let outgoing = self.shared.outgoing.clone();
-        self.shared.runtime.spawn(async move {
-            let notification = ServerNotification::FuzzyFileSearchSessionCompleted(
-                FuzzyFileSearchSessionCompletedNotification { session_id },
-            );
-            outgoing.send_server_notification(notification).await;
-        });
-    }
-}
-
-impl file_search::SessionReporter for SessionReporterImpl {
-    fn on_update(&self, snapshot: &file_search::FileSearchSnapshot) {
-        self.send_snapshot(snapshot);
-    }
-
-    fn on_complete(&self) {
-        self.send_complete();
-    }
-}
-
-fn collect_files(snapshot: &file_search::FileSearchSnapshot) -> Vec<FuzzyFileSearchResult> {
-    let mut files = snapshot
-        .matches
-        .iter()
-        .map(|m| {
-            let file_name = m.path.file_name().unwrap_or_default();
-            FuzzyFileSearchResult {
-                root: m.root.to_string_lossy().to_string(),
-                path: m.path.to_string_lossy().to_string(),
-                match_type: match m.match_type {
-                    file_search::MatchType::File => FuzzyFileSearchMatchType::File,
-                    file_search::MatchType::Directory => FuzzyFileSearchMatchType::Directory,
-                },
-                file_name: file_name.to_string_lossy().to_string(),
-                score: m.score,
-                indices: m.indices.clone(),
-            }
-        })
-        .collect::<Vec<_>>();
-
-    files.sort_by(file_search::cmp_by_score_desc_then_path_asc::<
-        FuzzyFileSearchResult,
-        _,
-        _,
-    >(|f| f.score, |f| f.path.as_str()));
-    files
 }

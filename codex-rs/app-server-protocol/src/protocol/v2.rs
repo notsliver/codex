@@ -225,6 +225,89 @@ impl From<CoreNonSteerableTurnKind> for NonSteerableTurnKind {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum CodeGraphNodeType {
+    Function,
+    Component,
+    Hook,
+    Api,
+    Event,
+    Module,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum CodeGraphNodeImportance {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum CodeGraphCacheStatus {
+    Hit,
+    Miss,
+    Refreshed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CodeGraphNode {
+    pub id: String,
+    #[serde(rename = "type")]
+    #[ts(rename = "type")]
+    pub node_type: CodeGraphNodeType,
+    pub file: String,
+    pub what_it_is: String,
+    pub behavior_summary: String,
+    pub calls: Vec<String>,
+    pub triggered_by: Vec<String>,
+    pub affects: Vec<String>,
+    pub side_effects: Vec<String>,
+    pub importance: CodeGraphNodeImportance,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CodeGraphFileSlice {
+    pub node_id: String,
+    pub file: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CodeGraphQueryParams {
+    pub query: String,
+    pub roots: Vec<String>,
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+    #[ts(optional = nullable)]
+    pub expand_nodes: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CodeGraphQueryResponse {
+    pub entry_node_ids: Vec<String>,
+    pub flow: Vec<String>,
+    pub nodes: Vec<CodeGraphNode>,
+    pub files: Vec<CodeGraphFileSlice>,
+    pub compiled_context: String,
+    pub cache_status: CodeGraphCacheStatus,
+}
+
 #[derive(
     Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS, ExperimentalApi,
 )]
@@ -2171,12 +2254,16 @@ pub struct FsReadFileParams {
 }
 
 /// Base64-encoded file contents returned by `fs/readFile`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct FsReadFileResponse {
     /// File contents encoded as base64.
     pub data_base64: String,
+    /// Optional graph-derived context for the file, if available.
+    #[experimental("fs/readFile graph context")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_context: Option<String>,
 }
 
 /// Write a file on the host filesystem.
@@ -6507,6 +6594,7 @@ mod tests {
     fn fs_read_file_response_round_trips_base64_data() {
         let response = FsReadFileResponse {
             data_base64: "aGVsbG8=".to_string(),
+            graph_context: None,
         };
 
         let value = serde_json::to_value(&response).expect("serialize fs/readFile response");

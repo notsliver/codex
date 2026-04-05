@@ -15,6 +15,7 @@ use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
+use codex_app_server_protocol::CodeGraphQueryParams;
 use codex_app_server_protocol::CollaborationModeListParams;
 use codex_app_server_protocol::CommandExecParams;
 use codex_app_server_protocol::CommandExecResizeParams;
@@ -953,6 +954,14 @@ impl McpProcess {
             .send_fuzzy_file_search_session_stop_request(session_id)
             .await?;
         self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
+    pub async fn send_code_graph_query_request(
+        &mut self,
+        params: CodeGraphQueryParams,
+    ) -> anyhow::Result<i64> {
+        self.send_request("codeGraph/query", Some(serde_json::to_value(params)?))
             .await
     }
 

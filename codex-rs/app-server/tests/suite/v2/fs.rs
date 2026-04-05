@@ -177,6 +177,7 @@ async fn fs_methods_cover_current_fs_utils_surface() -> Result<()> {
         read_response,
         FsReadFileResponse {
             data_base64: STANDARD.encode("hello from app-server"),
+            graph_context: None,
         }
     );
 
@@ -300,6 +301,7 @@ async fn fs_write_file_accepts_base64_bytes() -> Result<()> {
         read_response,
         FsReadFileResponse {
             data_base64: STANDARD.encode(bytes),
+            graph_context: None,
         }
     );
 

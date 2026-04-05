@@ -65,6 +65,7 @@ use codex_core::config_loader::LoaderOverrides;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
+use codex_rollout::RolloutConfigView;
 use codex_login::AuthManager;
 use codex_login::auth::ExternalAuth;
 use codex_login::auth::ExternalAuthRefreshContext;
@@ -1027,10 +1028,32 @@ impl MessageProcessor {
     }
 
     async fn handle_fs_read_file(&self, request_id: ConnectionRequestId, params: FsReadFileParams) {
-        match self.fs_api.read_file(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
+        match self.fs_api.read_file(params.clone()).await {
+            Ok(mut response) => {
+                // Add graph context if available
+                let graph_context = self.get_graph_context_for_file(&params.path).await;
+                response.graph_context = graph_context;
+                self.outgoing.send_response(request_id, response).await;
+            }
             Err(error) => self.outgoing.send_error(request_id, error).await,
         }
+    }
+
+    async fn get_graph_context_for_file(&self, path: &codex_utils_absolute_path::AbsolutePathBuf) -> Option<String> {
+        use codex_code_graph::load_or_update_graph;
+        let codex_home = self.config.codex_home();
+        let roots = vec![codex_home.parent()?.to_string_lossy().to_string()];
+        let graph = load_or_update_graph(codex_home, &roots).ok()?;
+        let path_str = path.to_string_lossy();
+        let relative_path = path_str.strip_prefix(&roots[0]).unwrap_or(&path_str).trim_start_matches('/');
+        let file_entry = graph.files.get(relative_path)?;
+        let module_node = file_entry.nodes.iter().find(|record| record.node.node_type == codex_code_graph::GraphNodeType::Module)?;
+        let context = format!("File: {}\nSummary: {}\nNodes: {}", 
+            module_node.node.file,
+            module_node.node.behavior_summary,
+            file_entry.nodes.len()
+        );
+        Some(context)
     }
 
     async fn handle_fs_write_file(

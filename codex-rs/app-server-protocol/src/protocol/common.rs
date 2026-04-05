@@ -560,6 +560,11 @@ client_request_definitions! {
         params: FuzzyFileSearchParams,
         response: FuzzyFileSearchResponse,
     },
+    #[experimental("codeGraph/query")]
+    CodeGraphQuery => "codeGraph/query" {
+        params: v2::CodeGraphQueryParams,
+        response: v2::CodeGraphQueryResponse,
+    },
     #[experimental("fuzzyFileSearch/sessionStart")]
     FuzzyFileSearchSessionStart => "fuzzyFileSearch/sessionStart" {
         params: FuzzyFileSearchSessionStartParams,

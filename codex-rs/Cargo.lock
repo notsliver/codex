@@ -1410,6 +1410,7 @@ dependencies = [
  "codex-backend-client",
  "codex-chatgpt",
  "codex-cloud-requirements",
+ "codex-code-graph",
  "codex-config",
  "codex-core",
  "codex-exec-server",
@@ -1775,6 +1776,22 @@ dependencies = [
  "chrono",
  "codex-cloud-tasks-client",
  "diffy",
+]
+
+[[package]]
+name = "codex-code-graph"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "ignore",
+ "nucleo",
+ "pathdiff",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha1",
+ "syn 2.0.114",
+ "tempfile",
 ]
 
 [[package]]

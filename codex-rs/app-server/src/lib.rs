@@ -62,6 +62,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod app_server_tracing;
 mod bespoke_event_handling;
+mod code_graph;
 mod codex_message_processor;
 mod command_exec;
 mod config_api;
